@@ -1,0 +1,7 @@
+penguin-received.gif
+
+# Do not track the object files 
+*.o
+
+# Do not track the workspace settings files
+.vscode/
