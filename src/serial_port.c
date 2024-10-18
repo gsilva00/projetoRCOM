@@ -83,9 +83,9 @@ int openSerialPort(const char *serialPort, int baudRate)
     newtio.c_oflag = 0;
 
     // Set input mode (non-canonical, no echo,...)
-    newtio.c_lflag = 0;
-    newtio.c_cc[VTIME] = 0; // Block reading
-    newtio.c_cc[VMIN] = 1;  // Byte by byte
+    newtio.c_lflag = 0; // Non-canonic reception
+    newtio.c_cc[VTIME] = 1; // initally Block reading (VTIME 0, VMIN 1) -> teacher asked to change (VTIME 1, VMIN 0 -> read with timeout)
+    newtio.c_cc[VMIN] = 0;  // Byte by byte
 
     tcflush(fd, TCIOFLUSH);
 
