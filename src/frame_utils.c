@@ -1,7 +1,7 @@
 #include "frame_utils.h"
 
 
-unsigned int xor_all(const unsigned char *arr, int len)
+unsigned int funcI_BCC2(const unsigned char *arr, int len)
 {
   unsigned int res = 0;
 

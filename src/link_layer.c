@@ -18,13 +18,14 @@
 
 // ? For role distinction (for easier access, and MAINLY FOR llclose() -> why isn't it in the arguments???)
 static LinkLayerRole currRole;
+// ? For tracking the maximum number of retransmissions during the protocol (IS IT NEEDED?)
 static int currRetransmissions;
 
 // for stats (llclose())
 static unsigned int frameCount = 0;
 static unsigned int retransmissionCount = 0;
-static unsigned int timeoutCount = 0;
-static unsigned int errorCount = 0;
+static unsigned int timeoutCount = 0; // ?? Não terá a mesma contagem que retransmissionCount, já que de cada vez que ocorre um timeout de leitura de resposta, ocorre uma retransmission ??
+static unsigned int errorCount = 0;   // ?? A que tipos de erros é que isto se refere ?? Maximum number of retransmissions é considerado erro?
 
 // for alarm (used by Tx)
 static unsigned int alarmEnabled = FALSE;
@@ -54,7 +55,8 @@ int llopen(LinkLayer connectionParameters)
   currRole = connectionParameters.role;
   currRetransmissions = connectionParameters.nRetransmissions;
 
-  unsigned char openBuf[SU_BUF_SIZE] = {0};
+  unsigned char sendBuf[SU_BUF_SIZE] = {0};   // Buffer with SU message
+  unsigned char retBuf[SU_BUF_SIZE] = {0};    // Feedback buffer
 
   if (currRole == LlTx) {
     // Set alarm function handler
@@ -64,51 +66,59 @@ int llopen(LinkLayer connectionParameters)
     int readRet;
     while (alarmCount < connectionParameters.nRetransmissions && !uaReceived) {
       // Prepare and send SET frame
-      prepSU(openBuf, SU_Addr_TX, SU_C_SET);
-      if (writeSU(openBuf) == -1) {
+      prepSU(sendBuf, SU_Addr_TX, SU_C_SET);
+      if (writeSU(sendBuf) == -1) {
+        errorCount++;
         printf("%s: Tx write error!\n", __func__);
+        alarmCount = 0;
+        alarmEnabled = FALSE;
         return -1;
       }
-      // Clear the buffer with the sent message
-      // Will fill with received message
-      memset(openBuf, 0, sizeof(openBuf));
 
       // ALARM FOR MAX TIME TO RECEIVE UA
-      alarm(3);
+      alarm(ALARM_INTV);
       alarmEnabled = TRUE;
-      printf("Alarme set for 3 seconds!\n");
+      printf("Alarme set for %d seconds!\n", ALARM_INTV);
 
       // Receive UA frame
-      if ((readRet = readSU(&openBuf, SU_C_UA)) == -1) {
+      if ((readRet = readSU_OC(retBuf, SU_C_UA)) == -1) {
+        errorCount++;
         printf("%s: Tx readSU error!\n", __func__);
+        alarmCount = 0;
+        alarmEnabled = FALSE;
         return -1;
       }
       else if (readRet == 0) {
+        retransmissionCount++;
         printf("%s: Tx readSU timeout!\n", __func__);
         continue;
       }
-      else {
+      else { // readRet == 1
         uaReceived = TRUE;
-        alarmCount = 0;
-        alarmEnabled = FALSE;
-        printf("%s: UA frame received!\n", __func__);
+        printf("%s: Tx readSU success! UA frame received!\n", __func__);
       }
     }
 
+    // Reset alarm variables
+    alarmCount = 0;
+    alarmEnabled = FALSE;
+
     if (!uaReceived) { // Exceeded retransmissions (maybe Rx is turned off)
-      printf("%s: Maximum retransmissions reached, UA not received\n", __func__);
+      printf("%s: Maximum retransmissions reached, UA not received!\n", __func__);
       return -1;
     }
   }
   else { // currRole == LlRx
-    if (readSU(openBuf, SU_C_SET) == -1) {
+    if (readSU_OC(retBuf, SU_C_SET) == -1) {
+      errorCount++;
       printf("%s: Rx readSU error!\n", __func__);
       return -1;
     }
 
     // Prepare and send UA frame
-    prepSU(&openBuf, SU_Addr_TX, SU_C_UA);
-    if (writeSU(openBuf) == -1) {
+    prepSU(sendBuf, SU_Addr_TX, SU_C_UA);
+    if (writeSU(sendBuf) == -1) {
+      errorCount++;
       printf("%s: Rx write error!\n", __func__);
       return -1;
     }
@@ -123,9 +133,90 @@ int llopen(LinkLayer connectionParameters)
 ////////////////////////////////////////////////
 int llwrite(const unsigned char *buf, int bufSize)
 {
-  // TODO
+  // ?? O bufSize não devia ser unsigned int (já que nunca poderá ser negativo)
+  if (bufSize <= 0) {
+    return -1; // Invalid buffer size
+  }
 
-  return 0;
+  // ?? Why is this error happening (é pela macro ser dinâmica)
+  unsigned char stuffBuf[I_BUF_SIZE] = {0}; // Array that will be filled with the frame (including stuffed bits)
+  unsigned char retBuf[SU_BUF_SIZE] = {0};  // Feedback buffer
+
+  // ?? O BUF VEM COM HEADER E TAILER??? ACHO QUE NÃO
+  // while (i < 4) { // Header
+  //   stuffBuf[i] = buf[i];
+  //   i++;
+  // }
+  // Preparing Header
+  stuffBuf[0] = I_Flag;
+  stuffBuf[1] = I_Addr_TX;
+  stuffBuf[2] = I_C(frameCount);
+  stuffBuf[3] = I_BCC1(stuffBuf[1], stuffBuf[2]);
+
+  // Byte stuffing the packet
+  int i = 0, j = 4;
+  while (i < bufSize) {
+    if (buf[i] == I_Flag || buf[i] == STUFF_ESC) {
+        stuffBuf[j++] = STUFF_ESC;
+        stuffBuf[j++] = STUFF_MASK(buf[i++]);
+    } else {
+        stuffBuf[j++] = buf[i++];
+    }
+  }
+
+  // Preparing Trailer
+  stuffBuf[j++] = funcI_BCC2(buf, bufSize);
+  stuffBuf[j++] = I_Flag;
+  // ?? O BUF VEM COM HEADER E TAILER??? ACHO QUE NÃO
+  // while (i < bufSize) { // Trailer
+  //   stuffBuf[i] = buf[i];
+  //   i++;
+  // }
+
+  int rrReceived = FALSE;
+  int readRet;
+  while (alarmCount < currRetransmissions && !rrReceived) {
+    // ?? (void)signal(SIGALRM, alarmHandler); Already did it in llopen() probably don't need to do it again right ??
+
+    if (writeBytesSerialPort(stuffBuf, j) != j) { // ?? FAÇO != j OU == -1 ??
+      errorCount++;
+      printf("%s: Tx write error!\n", __func__);
+      return -1;
+    }
+
+    // ALARM FOR MAX TIME TO RECEIVE RR OR REJ
+    alarm(ALARM_INTV);
+    alarmEnabled = TRUE;
+    printf("Alarme set for %d seconds!\n", ALARM_INTV);
+
+    // Receive UA frame
+    if ((readRet = readSU_RW(retBuf, frameCount)) == -1) {
+      errorCount;
+      printf("%s: Tx readSU error!\n", __func__);
+      alarmCount = 0;
+      alarmEnabled = FALSE;
+      return -1;
+    }
+    else if (readRet == 0) {
+      retransmissionCount++;
+      printf("%s: Tx readSU timeout/Neg ACK received!\n", __func__);
+      continue;
+    }
+    else {
+      rrReceived = TRUE;
+      printf("%s: Tx readSU success! UA frame received!\n", __func__);
+    }
+  }
+
+  alarmCount = 0;
+  alarmEnabled = FALSE;
+
+  if (!rrReceived) { // Exceeded retransmissions (maybe Rx is turned off)
+    printf("%s: Maximum retransmissions reached, UA not received!\n", __func__);
+    return -1;
+  }
+
+  return j;
 }
 
 
@@ -159,6 +250,7 @@ int llclose(int showStatistics)
       // Prepare and send DISC frame
       prepSU(closeBuf, SU_Addr_TX, SU_C_DISC);
       if (writeSU(closeBuf) == -1) {
+        errorCount++;
         printf("%s: Tx write error!\n", __func__);
         return -1;
       }
@@ -169,12 +261,13 @@ int llclose(int showStatistics)
       memset(closeBuf, 0, sizeof(closeBuf));
 
       // ALARM FOR MAX TIME TO RECEIVE DISC
-      alarm(3);
+      alarm(ALARM_INTV);
       alarmEnabled = TRUE;
-      printf("Alarme set for 3 seconds!\n");
+      printf("Alarme set for %d seconds!\n", ALARM_INTV);
 
       // Receive DISC frame
-      if ((readRet = readSU(&closeBuf, SU_C_DISC)) == -1) {
+      if ((readRet = readSU_default(&closeBuf, SU_C_DISC)) == -1) {
+        errorCount++;
         printf("%s: Tx readSU error!\n", __func__);
         return -1;
       }
@@ -193,6 +286,7 @@ int llclose(int showStatistics)
       // Prepare to send UA frame (LAST)
       prepSU(closeBuf, SU_Addr_TX, SU_C_UA);
       if (writeSU(closeBuf) == -1) {
+        errorCount++;
         printf("%s: Tx write error!\n", __func__);
         return -1;
       }
@@ -230,24 +324,37 @@ static void statAnalysis() {
 // Send Supervision/Unnumbered Frames
 static int writeSU(const unsigned char *buf)
 {
-  if (writeBytesSerialPort(buf, 5) != 5) { // ?? FAÇO != 5 OU == -1
+  if (writeBytesSerialPort(buf, 5) != 5) { // ?? FAÇO != 5 OU == -1 ??
     return -1;
   }
   printf("Unnumbered (U) message written!\n");
   return 1;
 }
 
+
+// For llopen and llclose (UA, DISC) - frameNum not needed for SU-frames feedback
+inline int readSU_OC(unsigned char *buf, unsigned char ctrl)
+{
+  return readSU(buf, ctrl, -1);
+}
+// For llread and llwrite (RR0, RR1, REJ0, REJ1) - ctrl not needed for I-Frame feedback
+inline int readSU_RW(unsigned char *buf, int frameNum)
+{
+  return readSU(buf, 0xFF, frameNum);
+}
 // Read Supervision/Unnumbered Frames
-static int readSU(unsigned char *buf, unsigned char ctrl)
+static int readSU(unsigned char *buf, unsigned char ctrl, int frameNum)
 {
   SU_State currState = SU_START;
   unsigned char currByte;
-  // !! PASSAR ESTE WHILE PARA RECEBER UM A UM (É ISSO QUE É O PART LÁ EM BAIXO)
-  while (currState != SU_DONE && (!alarmEnabled && currRole == LlTx || currRole == LlRx)) {
+
+  // !! PASSAR ESTE WHILE PARA RECEBER UM A UM (É ISSO QUE É O PART LÁ EM BAIXO) - o que é isto??
+  while (currState != SU_DONE && ((!alarmEnabled && currRole == LlTx) || currRole == LlRx)) {
     // Receiver stays here until it reads SET,
     // Transmitter has timeout if not received UA, to send SET again
 
     if (readByteSerialPort(&currByte) == -1) { // Read error
+      errorCount++;
       return -1;
     }
 
@@ -259,47 +366,73 @@ static int readSU(unsigned char *buf, unsigned char ctrl)
         if (currByte == SU_Flag) {
           currState = SU_FLAG_STATE;
           buf[0] = currByte;
-          printf("State has changed from START to FLAG_STATE\n");
+          printf("State has changed from SU_START to SU_FLAG_STATE\n");
         }
         else {
           memset(buf, 0, sizeof(SU_BUF_SIZE));
-          printf("State didn't change from START because the byte isn't a Flag. Cleared the buffer\n");
+          printf("State didn't change from SU_START because the byte isn't a Flag. Cleared the buffer\n");
         }
         break;
 
       case SU_FLAG_STATE:
         if (currByte == SU_Addr_TX) {
           currState = SU_A_STATE;
-          printf("State has changed from FLAG_STATE to A_STATE\n");
+          printf("State has changed from SU_FLAG_STATE to SU_A_STATE\n");
           buf[1] = currByte;
         }
         else if (currByte == SU_Flag) {
-          printf("State didn't change from FLAG_STATE because the byte is a Flag, again.");
+          printf("State didn't change from SU_FLAG_STATE because the byte is a Flag, again.");
           continue;
         }
         else {
           memset(buf, 0, sizeof(SU_BUF_SIZE));
           currState = SU_START;
-          printf("State has changed from FLAG_STATE to START because the byte isn't an Address byte or a Flag. Cleared the buffer\n");
+          printf("State has changed from SU_FLAG_STATE to SU_START because the byte isn't an Address byte or a Flag. Cleared the buffer\n");
         }
         break;
 
       case SU_A_STATE:
-        if (currByte == ctrl) {
-          currState = SU_C_STATE;
-          buf[2] = currByte;
-          printf("State has changed from A_STATE to C_STATE.\n");
+        // !! For llopen and llclose
+        if (ctrl != 0xFF) { // && frameNum == -1
+          if (currByte == ctrl) {
+            currState = SU_C_STATE;
+            buf[2] = currByte;
+            printf("State has changed from SU_A_STATE to SU_C_STATE.\n");
+          }
+          else if (currByte == SU_Flag) {
+            currState = SU_FLAG_STATE;
+            memset(buf, 0, sizeof(SU_BUF_SIZE));
+            buf[1] = SU_Flag;
+            printf("State has changed from SU_A_STATE to SU_FLAG_STATE because the byte is a Flag.\n");
+          }
+          else {
+            currState = SU_START;
+            memset(buf, 0, sizeof(SU_BUF_SIZE));
+            printf("State has changed from SU_A_STATE to SU_START because the byte isn't a Control byte or a Flag. Cleared the buffer\n");
+          }
         }
-        else if (currByte == SU_Flag) {
-          currState = SU_FLAG_STATE;
-          memset(buf, 0, sizeof(SU_BUF_SIZE));
-          buf[1] = SU_Flag;
-          printf("State has changed from A_STATE to FLAG_STATE because the byte is a Flag.\n");
-        }
-        else {
-          currState = SU_START;
-          memset(buf, 0, sizeof(SU_BUF_SIZE));
-          printf("State has changed from A_STATE to START because the byte isn't a Control byte or a Flag. Cleared the buffer\n");
+        // !! For llread and llwrite
+        else { // ctrl == 0xFF (obviously && frameNum != -1)
+          if (currByte == SU_C_RR(frameNum)) {
+            currState = SU_C_STATE;
+            buf[2] = currByte;
+            printf("State has changed from SU_A_STATE to SU_C_STATE.\n");
+          }
+          else if (currByte == SU_C_REJ(frameNum)) {
+            printf("Function will return 0 because REJ response was reached!\n");
+            return 0;
+          }
+          else if (currByte == SU_Flag) {
+            currState = SU_FLAG_STATE;
+            memset(buf, 0, sizeof(SU_BUF_SIZE));
+            buf[1] = SU_Flag;
+            printf("State has changed from SU_A_STATE to SU_FLAG_STATE because the byte is a Flag.\n");
+          }
+          else {
+            currState = SU_START;
+            memset(buf, 0, sizeof(SU_BUF_SIZE));
+            printf("State has changed from SU_A_STATE to SU_START because the byte isn't a Control byte or a Flag. Cleared the buffer\n");
+          }
         }
         break;
 
@@ -308,18 +441,18 @@ static int readSU(unsigned char *buf, unsigned char ctrl)
         if (currByte == SU_BCC1(buf[1], buf[2])) { // Uses BCC to check if the message is correctly received
           currState = SU_BCC_STATE;
           buf[3] = currByte;
-          printf("State has changed from C_STATE to BCC_STATE.\n");
+          printf("State has changed from SU_C_STATE to SU_BCC_STATE.\n");
         }
         else if (currByte == SU_Flag) {
           currState = SU_FLAG_STATE;
           memset(buf, 0, sizeof(SU_BUF_SIZE));
           buf[1] = SU_Flag;
-          printf("State has changed from C_STATE to FLAG_STATE because the byte is a Flag.\n");
+          printf("State has changed from SU_C_STATE to SU_FLAG_STATE because the byte is a Flag.\n");
         }
         else {
           currState = SU_START;
           memset(buf, 0, sizeof(SU_BUF_SIZE));
-          printf("State has changed from C_STATE to START because the byte isn't a BCC byte or a Flag. Cleared the buffer\n");
+          printf("State has changed from SU_C_STATE to SU_START because the byte isn't a BCC byte or a Flag. Cleared the buffer\n");
         }
         break;
 
@@ -327,22 +460,31 @@ static int readSU(unsigned char *buf, unsigned char ctrl)
         if (currByte == SU_Flag) {
           currState = SU_DONE;
           buf[4] = currByte;
-          printf("State has changed from BCC_STATE to DONE\n");
+          printf("State has changed from SU_BCC_STATE to SU_DONE\n");
         }
         else {
           currState = SU_START;
           memset(buf, 0, sizeof(SU_BUF_SIZE));
-          printf("State has changed from C_STATE to START because the byte isn't a BCC byte or a Flag. Cleared the buffer\n");
+          printf("State has changed from SU_C_STATE to SU_START because the byte isn't a BCC byte or a Flag. Cleared the buffer\n");
         }
         break;
     }
   }
 
+  // Read timeout
   if (alarmEnabled) { // Only for LlTx
     alarmEnabled == FALSE;
     return 0;
   }
 
+  // Read success
   printf("SET message received!\n");
   return 1;
+}
+
+
+// Read Information Frame
+static int readSU(unsigned char *buf, unsigned char ctrl)
+{
+
 }
